@@ -143,7 +143,7 @@ func (p *provider) DeleteNodes(n []nodes.Node) error {
 	args = append(args,
 		"rm",
 		"-f", // force the container to be delete now
-		//"-v", // delete volumes
+		"-v", // delete volumes
 	)
 	for _, node := range n {
 		args = append(args, node.String())
