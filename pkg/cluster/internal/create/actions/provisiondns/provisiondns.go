@@ -152,11 +152,7 @@ func (a *Action) recreateDnsResources(ctx *actions.ActionContext, node nodes.Nod
 }
 
 func ageToDuration(d string) time.Duration {
-	if strings.Contains(d, "d"){
-		d = k8sAgeToStdFmt(d)
-	}
-
-	duration, _ := time.ParseDuration(d)
+	duration, _ := time.ParseDuration(k8sAgeToStdFmt(d))
 	return duration
 }
 
