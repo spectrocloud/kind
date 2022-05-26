@@ -18,9 +18,15 @@ limitations under the License.
 package provisiondns
 
 import (
+	"bytes"
+	"fmt"
+	"os"
 	"sigs.k8s.io/kind/pkg/cluster/internal/create/actions"
 	"sigs.k8s.io/kind/pkg/cluster/nodes"
 	"sigs.k8s.io/kind/pkg/cluster/nodeutils"
+	"sort"
+	"strconv"
+	"strings"
 
 	"time"
 )
@@ -51,14 +57,14 @@ func (a *Action) Execute(ctx *actions.ActionContext) error {
 		return err
 	}
 	node := controlPlanes[0]
-	if err := a.recreateDnsResources(node); err != nil {
+	if err := a.recreateDnsResources(ctx, node); err != nil {
 		return err
 	}
 	ctx.Status.End(true)
 	return nil
 }
 
-func (a *Action) recreateDnsResources(node nodes.Node) error {
+func (a *Action) recreateDnsResources(ctx *actions.ActionContext, node nodes.Node) error {
 	//deleting kube-root-ca.crt in kube-system namespace
 	_ = node.Command(
 		"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf",
@@ -70,6 +76,62 @@ func (a *Action) recreateDnsResources(node nodes.Node) error {
 		"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf",
 		"delete", "cm", "kube-root-ca.crt", "-n", "kube-public",
 	).Run()
+
+	//If etcd data is persisted locally then nodes information will also be present
+	//In case if kind cluster is created with diff name then node name will change and k8s will now have older node and new node
+	//Since, for older node, kubelet won't be present(as node is deleted), thus few pods gets stuck in Terminating state and
+	//in this case older node has to be terminated
+	//So, I am trying to list all nodes and sort it based on age and deleting older nodes (more then what is defined in kind config)
+	var getNodesWriter bytes.Buffer
+	cmd := node.Command(
+		"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf",
+		"get", "nodes",
+	)
+	cmd.SetStdout(&getNodesWriter)
+	cmd.SetStderr(os.Stderr)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to get nodes. %v", err)
+	}
+
+	getNodesOutput := getNodesWriter.String()
+	lines := strings.Split(getNodesOutput, "\n")
+	nodes := make(map[string]string)
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		line = strings.Join(strings.Fields(line), " ")
+		values := strings.Split(line, " ")
+		if values[0] == "NAME"{
+			continue
+		}
+		nodes[ageToDuration(values[3]).String()] = values[0]
+	}
+
+	if len(nodes) > 1 {
+		keys := make([]string, 0, len(nodes))
+		for key := range nodes {
+			keys = append(keys, key)
+		}
+		sort.SliceStable(keys, func(i, j int) bool{
+			return ageToDuration(keys[i]) < ageToDuration(keys[j])
+		})
+
+		//Nodes more than currect total nodes will be removed from kind cluster
+		allNodes, _ := ctx.Nodes()
+		args := []string{"--kubeconfig=/etc/kubernetes/admin.conf", "delete", "nodes"}
+		for i := len(allNodes); i < len(keys); i++ {
+			args = append(args, nodes[keys[i]])
+		}
+
+		//ctx.Logger.V(1).Info(fmt.Sprintf("node names to be deleted: %v", args))
+		delNodesCmd := node.Command("kubectl", args...)
+		delNodesCmd.SetStderr(os.Stderr)
+		if err := delNodesCmd.Run(); err != nil {
+			ctx.Logger.Error(fmt.Sprintf("failed to delete older nodes %s", err.Error()))
+			return err
+		}
+	}
 
 	_ = node.Command(
 		"kubectl", "--kubeconfig=/etc/kubernetes/admin.conf",
@@ -87,4 +149,51 @@ func (a *Action) recreateDnsResources(node nodes.Node) error {
 	).Run()
 
 	return nil
+}
+
+func ageToDuration(d string) time.Duration {
+	if strings.Contains(d, "d"){
+		d = k8sAgeToStdFmt(d)
+	}
+
+	duration, _ := time.ParseDuration(d)
+	return duration
+}
+
+func k8sAgeToStdFmt(d string) string {
+	if strings.Contains(d, "d"){
+		hours := int64(0)
+		dd := strings.Split(d, "d")
+		noOfDays, _ := strconv.ParseInt(dd[0], 10, 32)
+		hours = noOfDays * 24
+		if len(dd) > 1 && len(dd[1]) > 0 {
+			hh := strings.Split(dd[1], "h")
+			noOfHours, _ := strconv.ParseInt(hh[0], 10, 32)
+			hours = hours + noOfHours
+		}
+		return fmt.Sprintf("%dh", hours)
+	} else if strings.Contains(d, "h") && strings.Contains(d, "m"){
+		minutes := int64(0)
+		hh := strings.Split(d, "h")
+		noOfHours, _ := strconv.ParseInt(hh[0], 10, 32)
+		minutes = noOfHours * 60
+		if len(hh) > 1 && len(hh[1]) > 0 {
+			mm := strings.Split(hh[1], "m")
+			noOfMins, _ := strconv.ParseInt(mm[0], 10, 32)
+			minutes = minutes + noOfMins
+		}
+		return fmt.Sprintf("%dm", minutes)
+	} else if strings.Contains(d, "m") && strings.Contains(d, "s"){
+		seconds := int64(0)
+		mm := strings.Split(d, "m")
+		noOfMins, _ := strconv.ParseInt(mm[0], 10, 32)
+		seconds = noOfMins * 60
+		if len(mm) > 1 && len(mm[1]) > 0 {
+			ss := strings.Split(mm[1], "s")
+			noOfSeconds, _ := strconv.ParseInt(ss[0], 10, 32)
+			seconds = seconds + noOfSeconds
+		}
+		return fmt.Sprintf("%ds", seconds)
+	}
+	return d
 }
